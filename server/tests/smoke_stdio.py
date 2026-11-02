@@ -12,6 +12,7 @@ import sys
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from lightroom_mcp.__main__ import out
 
 
 def first_text(result) -> str:
@@ -47,7 +48,7 @@ async def main() -> int:
             print("   stats notes:", info["stats"]["notes_heuristic"], "| mean", info["stats"]["mean_brightness_0_255"])
             doctor = await session.call_tool("lr_doctor", {})
             print("lr_doctor ->")
-            print(first_text(doctor))
+            out(first_text(doctor))
             if os.environ.get("SMOKE_WRITE") == "1":
                 await write_round_trip(session, first_text)
     return 0

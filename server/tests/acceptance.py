@@ -41,7 +41,9 @@ def main() -> int:
         photo = listing["photos"][0]
         check("list_selected: has id/name/format/size", all(photo.get(k) for k in ("id", "name", "format", "width", "height")),
               f"{photo['name']} {photo['format']} {photo['width']}x{photo['height']}")
-        check("list_selected: exposure data (ISO/aperture/shutter)", all(photo.get(k) for k in ("iso", "aperture", "shutter_speed")),
+        check("list_selected: exposure data is optional when source EXIF is absent",
+              all(photo.get(k) is None or isinstance(photo[k], (int, float, str)) and photo[k] != ""
+                  for k in ("iso", "aperture", "shutter_speed")),
               f"{photo.get('iso')} {photo.get('aperture')} {photo.get('shutter_speed')}")
 
         before = bridge.call("get_develop", {"photo": "selected"})

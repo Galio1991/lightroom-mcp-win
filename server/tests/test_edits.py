@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from lightroom_mcp import edits
-from lightroom_mcp.bridge import BridgeError
+from lightroom_mcp.bridge import BridgeError, BridgeTimeout
 from lightroom_mcp.edits import EditError, EditService, EditStore, ReadOnlyError, validate_changes
 
 LIMITS_LUA = Path(__file__).resolve().parents[2] / "plugin" / "lrmcp.lrdevplugin" / "Limits.lua"
@@ -314,6 +314,34 @@ def test_restore_original_goes_back_to_the_very_first_values(env):
     assert "无需还原" in service.restore_original()["note"]
 
 
+def test_restore_original_uses_first_value_even_after_earlier_edit_was_restored(env):
+    lr, _, service, _ = env
+    first = service.set_develop({"Exposure2012": 0.8})
+    service.set_develop({"Exposure2012": 1.5})
+    service.restore(first["edit_id"])
+    assert service.restore_original(dry_run=True)["will_write"]["Exposure2012"] == 0.0
+    service.restore_original()
+    assert lr.photos[A]["values"]["Exposure2012"] == 0.0
+
+
+def test_timed_out_write_keeps_a_restorable_backup(env):
+    lr, store, service, _ = env
+    original = lr._set
+
+    def applied_then_timed_out(params):
+        original(params)
+        raise BridgeTimeout("reply timed out")
+
+    lr._set = applied_then_timed_out
+    with pytest.raises(BridgeTimeout):
+        service.set_develop({"Exposure2012": 0.5})
+    record = store.all()[0]
+    assert record["status"] == "uncertain" and record["before"]["Exposure2012"] == 0.0
+    lr._set = original
+    service.restore(record["edit_id"])
+    assert lr.photos[A]["values"]["Exposure2012"] == 0.0
+
+
 def test_restore_original_only_touches_the_chosen_photo(env):
     lr, store, service, _ = env
     service.set_develop({"Exposure2012": 0.5}, photo="AAAAAAAA-1111")
@@ -518,6 +546,39 @@ def test_preset_pending_record_holds_a_snapshot_before_anything_is_applied(env):
     assert seen["snapshot_on_disk"] is True
 
 
+def test_timed_out_preset_keeps_snapshot_and_can_be_restored(env):
+    lr, store, service, _ = env
+    original = lr._apply_preset
+
+    def applied_then_timed_out(params):
+        original(params)
+        raise BridgeTimeout("reply timed out")
+
+    lr._apply_preset = applied_then_timed_out
+    with pytest.raises(BridgeTimeout):
+        service.apply_preset("PRESET-AAAA-0001")
+    record = store.all()[0]
+    assert record["status"] == "uncertain" and "snapshot" in record
+    service.restore(record["edit_id"])
+    assert lr.photos[A]["values"]["Contrast2012"] == 0.0
+    assert lr.photos[A]["values"]["Look"]["Name"] == "Adobe Color"
+
+
+def test_restore_original_recovers_a_timed_out_preset(env):
+    lr, _, service, _ = env
+    original = lr._apply_preset
+
+    def applied_then_timed_out(params):
+        original(params)
+        raise BridgeTimeout("reply timed out")
+
+    lr._apply_preset = applied_then_timed_out
+    with pytest.raises(BridgeTimeout):
+        service.apply_preset("PRESET-AAAA-0001")
+    service.restore_original()
+    assert lr.photos[A]["values"]["Contrast2012"] == 0.0
+
+
 def test_masked_preset_is_refused_and_recorded_as_failed(env):
     lr, store, service, _ = env
     with pytest.raises(BridgeError):
@@ -573,6 +634,17 @@ def test_batch_dry_run_changes_nothing_and_apply_needs_the_plan(env):
         assert lr.photos[pid]["values"]["Exposure2012"] == 0.3 and lr.photos[pid]["values"]["Contrast2012"] == 10.0
     with pytest.raises(EditError):    # the plan is single use
         service.batch_apply(plan["plan_id"])
+
+
+def test_batch_stops_if_a_photo_changed_after_dry_run(env):
+    lr, _, service, _ = env
+    lr.selected = [A, B]
+    plan = service.batch_plan({"Exposure2012": 0.3}, "selected")
+    lr.photos[A]["values"]["Exposure2012"] = 0.2
+    result = service.batch_apply(plan["plan_id"])
+    assert result["changed"] == 0 and "重新 dry_run" in result["results"][0]["error"]
+    assert lr.write_calls == 0
+    assert lr.photos[B]["values"]["Exposure2012"] == 0.0
 
 
 def test_batch_restore_undoes_every_photo_and_is_idempotent(env):
@@ -669,6 +741,25 @@ def test_metadata_restore_only_touches_what_was_changed(env):
     lr.photos[A]["meta"]["title"] = "typed by hand later"
     service.restore(result["edit_id"])
     assert lr.photos[A]["meta"]["rating"] == 0 and lr.photos[A]["meta"]["title"] == "typed by hand later"
+
+
+def test_timed_out_metadata_write_keeps_keyword_undo_data(env):
+    lr, store, service, _ = env
+    original = lr._set_metadata
+
+    def applied_then_timed_out(params):
+        original(params)
+        raise BridgeTimeout("reply timed out")
+
+    lr._set_metadata = applied_then_timed_out
+    with pytest.raises(BridgeTimeout):
+        service.set_metadata(rating=4, add_keywords=["test"])
+    record = store.all()[0]
+    assert record["status"] == "uncertain" and record["added_keywords"] == ["test"]
+    lr._set_metadata = original
+    service.restore(record["edit_id"])
+    assert lr.photos[A]["meta"]["rating"] == 0
+    assert lr.photos[A]["meta"]["keywords"] == []
 
 
 def test_metadata_validation(env):

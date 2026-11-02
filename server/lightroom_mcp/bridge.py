@@ -35,6 +35,10 @@ class BridgeError(RuntimeError):
     """The plug-in answered with an error, timed out or sent something unreadable."""
 
 
+class BridgeTimeout(BridgeError):
+    """The plug-in may have applied a write without returning its result."""
+
+
 def restrict_to_current_user(path: Path) -> None:
     """Best effort: only the current user may read the token file (Windows ACL)."""
     user = os.environ.get("USERNAME")
@@ -42,7 +46,7 @@ def restrict_to_current_user(path: Path) -> None:
         return
     try:
         subprocess.run(
-            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(R,W)"],
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(M)"],
             capture_output=True,
             check=False,
             timeout=10,
@@ -215,7 +219,7 @@ class Bridge:
         self._jobs.put((job_id, "cmd " + str(job_id) + " " + " ".join(parts)))
         if not event.wait(timeout):
             self._events.pop(job_id, None)
-            raise BridgeError(f"插件没有在 {timeout:.0f} 秒内回应命令 {command}。Lightroom 可能正忙或已卡住。")
+            raise BridgeTimeout(f"插件没有在 {timeout:.0f} 秒内回应命令 {command}。Lightroom 可能正忙或已卡住。")
         raw = self._results.pop(job_id, "")
         try:
             reply = json.loads(raw)

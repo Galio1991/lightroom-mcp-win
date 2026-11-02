@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import config
+from .bridge import BridgeTimeout
 
 COLORS = ("Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta")
 GLOBAL_KEYS = (
@@ -437,6 +438,10 @@ class EditService:
         self.store.save(record)  # the old values are on disk BEFORE anything is written
         try:
             data = self._write(photo_id, record["edit_id"], wanted, restoring=False)
+        except BridgeTimeout as e:
+            record.update(status="uncertain", error=str(e))
+            self.store.save(record)
+            raise
         except Exception as e:
             record.update(status="failed", error=str(e))
             self.store.save(record)
@@ -470,6 +475,14 @@ class EditService:
         values = {k: as_number_or_list(v) for k, v in record["before"].items()}
         new_id = self.store.new_id()
         if record.get("generic"):
+            if record.get("status") == "uncertain":
+                snapshot = record["snapshot"]
+                current = self.call("snapshot", {"photo": record["photo_id"]}, timeout=60)["settings"]
+                values = {k: v for k, v in snapshot.items() if k in current and current[k] != v}
+                if not values:
+                    record["restored_by"] = "no change"
+                    self.store.save(record)
+                    return {"edit_id": edit_id, "note": "预设没有改变已有设置，无需还原。"}
             data = self._write_generic(record["photo_id"], new_id, values)
             values = {k: v for k, v in values.items() if not isinstance(v, (dict, list))}  # what the summary can compare
         else:
@@ -498,18 +511,27 @@ class EditService:
             photo_id = listing["active_id"]
         else:
             photo_id = photo
-        records = [r for r in self.store.all()
+        history = [r for r in self.store.all()
                    if r.get("photo_id") == photo_id and r.get("kind") == "set"
-                   and r.get("status") in ("applied", "pending") and not r.get("restored_by")]
+                   and r.get("status") in ("applied", "pending", "uncertain")]
+        records = [r for r in history if not r.get("restored_by")]
         if not records:
             return {"photo_id": photo_id, "note": "没有 LrMCP 改过这张照片（或都已还原），无需还原。"}
+        for r in records:
+            if r.get("generic") and r.get("status") == "uncertain" and r.get("snapshot"):
+                current = self.call("snapshot", {"photo": photo_id}, timeout=60)["settings"]
+                r["before"] = {k: v for k, v in r["snapshot"].items() if k in current and current[k] != v}
         earliest: dict = {}
         earliest_wb: str | None = None
-        for r in records:  # records are sorted oldest first: keep the first old value of each slider
+        active_keys = {k for r in records for k in r.get("before", {})}
+        for r in history:  # restored earlier edits still establish the original value
             for key, value in r.get("before", {}).items():
-                earliest.setdefault(key, as_number_or_list(value))
+                if key in active_keys:
+                    earliest.setdefault(key, as_number_or_list(value))
             if earliest_wb is None and r.get("before_wb"):
                 earliest_wb = r["before_wb"]
+        if not earliest:
+            return {"photo_id": photo_id, "note": "没有需要写回的设置。"}
         plan = {"photo": records[0].get("photo_name"), "edits_undone": [r["edit_id"] for r in records], "will_write": earliest}
         if dry_run:
             return {**plan, "dry_run": True,
@@ -611,6 +633,13 @@ class EditService:
         self.store.save(record)   # the old values are on disk BEFORE anything is written
         try:
             data = self.call("set_metadata", {"photo": photo_id, "edit": record["edit_id"], **wire}, timeout=60)
+        except BridgeTimeout as e:
+            had = set(before.get("keywords", []))
+            record.update(status="uncertain", error=str(e),
+                          added_keywords=[k for k in plain.get("add_keywords", []) if k not in had],
+                          removed_keywords=[k for k in plain.get("remove_keywords", []) if k in had])
+            self.store.save(record)
+            raise
         except Exception as e:
             record.update(status="failed", error=str(e))
             self.store.save(record)
@@ -714,7 +743,7 @@ class EditService:
                 continue
             rows.append({"photo": name, "photo_id": pid, "will_change": True,
                          "changes": [{"parameter": k, "before": before[k], "after": targets[k]} for k in clean]})
-            items.append((pid, name, targets))
+            items.append((pid, name, before, targets))
         plan_id = secrets.token_hex(6)
         now = time.time()
         for old in [k for k, v in self._plans.items() if v["expires"] < now]:
@@ -736,8 +765,11 @@ class EditService:
             raise EditError("找不到这个计划，或者它已经用过 / 过期了。请先用 dry_run=true 重新预演一次。")
         results, members = [], []
         stopped = None
-        for pid, name, targets in plan["items"]:
+        for pid, name, before, targets in plan["items"]:
             try:
+                current = current_values(self.call("get_develop", {"photo": pid}, timeout=30), before)
+                if any(abs(current[k] - value) > 1e-3 for k, value in before.items()):
+                    raise EditError("照片参数在预演后已改变；请重新 dry_run。")
                 done = self.set_develop(targets, reason=reason or plan["reason"], photo=pid)
                 members.append(done["edit_id"])
                 results.append({"photo": name, "edit_id": done["edit_id"], "verified": done["verified"]})
@@ -801,6 +833,10 @@ class EditService:
         self.store.save(record)
         try:
             data = self.call("apply_preset", {"photo": photo_id, "edit": record["edit_id"], "preset": preset_id}, timeout=60)
+        except BridgeTimeout as e:
+            record.update(status="uncertain", error=str(e))
+            self.store.save(record)  # keep the snapshot so a timed-out write remains restorable
+            raise
         except Exception as e:
             record.update(status="failed", error=str(e))
             record.pop("snapshot", None)

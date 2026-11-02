@@ -50,6 +50,7 @@ def main() -> int:
     store_dir = Path(tempfile.mkdtemp(prefix="lrmcp-acceptance-"))
     service = EditService(bridge.call, EditStore(store_dir), readonly_file=store_dir / "readonly")
     readonly_flag = config.DATA_DIR / "readonly"  # the file the PLUG-IN checks
+    readonly_flag_created = False
     photo_id = None
     try:
         if not bridge.wait_connected(40):
@@ -223,6 +224,7 @@ def main() -> int:
 
         # 5. read-only switch: the plug-in checks its own flag file even if the server is bypassed
         readonly_flag.write_text("1")
+        readonly_flag_created = True
         try:
             try:
                 service2 = EditService(bridge.call, EditStore(store_dir), readonly_file=readonly_flag)
@@ -237,6 +239,7 @@ def main() -> int:
                 check("read-only: plug-in refuses by itself", "只读模式" in str(e))
         finally:
             readonly_flag.unlink(missing_ok=True)
+            readonly_flag_created = False
 
         # 6. history of edits
         listed = service.list_edits(photo=photo_id)
@@ -246,7 +249,8 @@ def main() -> int:
         original = service.restore_original(photo=photo_id)
         check("restore_original verified", original["verified"], f"undid {len(original['edits_undone'])} edit(s)")
     finally:
-        readonly_flag.unlink(missing_ok=True)
+        if readonly_flag_created:
+            readonly_flag.unlink(missing_ok=True)
         if photo_id:
             try:  # whatever happened above, put the test photo back
                 service.restore_original(photo=photo_id)
