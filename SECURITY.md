@@ -7,9 +7,10 @@
 - **目录信息的修改：** 星级、旗标、颜色标签、标题、说明、关键词（一次一张照片，限制长度，旧值先存盘，可还原；不能删除关键词本身，也不碰其他元数据）。
 - **批量修改的限制：** 一次最多 10 张；必须先预演（预演什么都不改），再用预演返回的一次性编号执行（15 分钟有效）；只做滑块的相对改动，不做裁剪/曲线；遇到第一个失败就停止；每张照片各自存旧值，可单张或整批还原。
 - **预设的还原机制：** 套预设时，整张照片的设置先存盘；还原时插件只接受“照片当前已有、类型相同、在已知范围内”的项，永远不接受蒙版。Lightroom 自己生成的内部值（如 GrainSeed）还原不掉，不影响画面。
-- **0.2 起能修改少数滑块**（曝光、十个全局滑块、24 个 HSL 值、RAW 照片的色温/色调、颜色分级、相机校准、色调曲线、锐化降噪、暗角颗粒去边、裁剪与拉直；可套用不带蒙版的开发预设；其他都不动：不碰蒙版、元数据，不删除，不导入导出）。每次修改都有范围限制和单次限幅，一次只改一张照片，**改之前先把旧值存到** `C:\Users\<你>\LrMcp\edits`，随时可还原。**只读开关**（文件 `C:\Users\<你>\LrMcp\readonly`）会让服务和插件拒绝一切修改。0.1 版是纯只读。
+- **受保护的修改：**可修改白名单内的调整参数、目录信息，并套用不带蒙版的开发预设；不碰蒙版，不删除或导入导出照片。调整参数有范围和单次限幅，修改前把旧值存到 `C:\Users\<你>\LrMcp\edits`。**只读开关**（文件 `C:\Users\<你>\LrMcp\readonly`）会让服务和插件拒绝一切修改。0.1 版是纯只读。
 - 它还会写的文件：预览 JPEG（`LrMcp\previews`，不会加入你的 Lightroom 目录）、口令、端口/日志文件和修改记录，都在 `C:\Users\<你>\LrMcp`。
-- **在真实作品上用修改功能前，请先备份目录。** 能改滑块的 AI 也可能把照片改难看；还原会写回保存的旧值（会覆盖你之后手动改过的同一个值）。
+- **在真实作品上用修改功能前，请先备份目录。** 开发分支会在还原前检查后续改动，发现冲突时默认拒绝覆盖；用户明确确认后可用 `force=true` 覆盖。
+- Lightroom 会自行规范化部分预设参数（如 `LensBlur`）；这些参数的后续手动改动无法可靠识别冲突。还原预设前请先查看照片及预演结果。
 - 所有东西都在你自己的电脑上运行。Python 服务只监听 `127.0.0.1`，且独占端口。除下面的更新提醒外，本项目不会通过网络发送任何东西。**注意：** 工具返回的预览图和照片信息会发给你连接的 AI 服务（Claude、Codex 等），这是它的工作方式，所以只对愿意分享给该服务的照片使用。
 - 插件和服务之间的请求需要随机口令（每次服务启动重新生成）、正确的 `Host` 头，并且带 `Origin` 头（浏览器会加）的请求一律拒绝，所以网页无法和服务通信。
 - 插件只运行固定白名单里的命令，从不接收请求里的文件路径；修改时插件自己再检查滑块白名单、范围、单次限幅和只读开关，不信任服务。
@@ -34,15 +35,16 @@
 
 ## What this software can and cannot do
 
-- **Since 0.2 it can change a small set of sliders** (exposure, the ten global sliders, 24 HSL values, temperature/tint of RAW photos, colour grading, calibration, tone curves, sharpening/noise reduction, vignettes/grain/defringe, crop and straighten; nothing else: no
-  masks, metadata, no deleting, no import/export). Every change is limited by
-  range and by a step per call, one photo at a time, and the old values are saved first (`C:\Users\<you>\LrMcp\edits`)
-  so it can be restored. A **read-only switch** (file `C:\Users\<you>\LrMcp\readonly`) makes the server and the plug-in
-  refuse every change. Version 0.1 was read-only.
+- **Guarded changes:** it can change whitelisted develop settings and catalog metadata, and apply presets without masks.
+  It cannot edit masks, delete photos, or import/export. Develop changes have range and step limits, and old values are
+  saved before a write (`C:\Users\<you>\LrMcp\edits`) for restoration. A **read-only switch** (file
+  `C:\Users\<you>\LrMcp\readonly`) makes the server and plug-in refuse every change. Version 0.1 was read-only.
 - Other files it writes: preview JPEGs in `C:\Users\<you>\LrMcp\previews` (never added to your catalog), a token, a
   port/log file and the saved change records, all in `C:\Users\<you>\LrMcp`.
-- **Back up your catalog before using the change tools on real work.** An AI assistant that can change sliders can make
-  a photo look worse; restoring writes the saved values back (it overwrites a value you changed by hand afterwards).
+- **Back up your catalog before using the change tools on real work.** The development branch checks for later changes
+  before restoration and refuses conflicting writes by default; `force=true` overwrites only after explicit review.
+- Lightroom normalizes some preset settings, such as `LensBlur`. Later manual changes to these settings cannot be
+  detected reliably, so inspect the photo and restoration plan before restoring a preset.
 - Everything runs on your own computer. The Python server listens on `127.0.0.1` only, with an exclusive bind
   (no other process can share the port). Nothing is sent over the internet by this project. **Note:** the preview
   images and photo information that the tools return go to whichever AI service you connect (Claude, Codex, ...);

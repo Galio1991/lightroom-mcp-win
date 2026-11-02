@@ -2,8 +2,8 @@
 
 **Let Claude or Codex look at your photos in Adobe Lightroom Classic.**
 A Lightroom plug-in plus a small MCP server. It can see the photo you selected, read its develop settings, and show
-the assistant a preview with histogram numbers. Since 0.2 it can also **make small, guarded changes to a few sliders
-and undo them**. Everything else stays untouched.
+the assistant a preview with histogram numbers. It can also make guarded develop changes, update catalog information,
+and save old values for restoration.
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue) ![Platform: Windows](https://img.shields.io/badge/platform-Windows-lightgrey) ![Status: early](https://img.shields.io/badge/status-early%200.11.1-orange)
 
@@ -23,12 +23,14 @@ and undo them**. Everything else stays untouched.
 | `lr_get_develop` | Current develop settings: exposure, contrast, highlights, shadows, white balance, HSL, … |
 | `lr_get_preview` | A 1024 px preview (256–2048) **plus numbers**: brightness, clipped highlights/shadows, warm/cool balance |
 | `lr_doctor` | Self check in Chinese: what is wrong and how to fix it |
-| `lr_set_develop` | **Changes** a few sliders of one photo (exposure, contrast, highlights, shadows, whites, blacks, texture, clarity, dehaze, vibrance, saturation, HSL), with range and per-call step limits; can return a preview right after |
+| `lr_set_develop` | **Changes** supported settings of one photo with range and step limits; `preview=true` returns before and after previews with numeric differences |
+| `lr_review_selected` (in development) | Show previews and statistics for up to 10 selected photos to help choose picks; it does not change ratings or flags |
 | `lr_restore` | Puts the sliders of one earlier change back to their old values |
 | `lr_restore_original` | Puts every slider LrMCP changed on a photo back to its value before LrMCP's first change (`dry_run` shows what it would do) |
 | `lr_get_metadata` / `lr_set_metadata` | Read and change catalog information: rating, flag (pick / reject), colour label, title, caption, keywords; old values are saved first and can be restored |
 | `lr_batch_set_develop` | Batch: add the same relative change to several photos (at most 10). Dry run first (changes nothing, returns each photo's result and a plan id), executed only with that plan id; the whole batch can be undone at once |
-| `lr_list_presets` / `lr_apply_preset` | Find develop presets and apply one to a photo (presets without masks; the whole state is saved first and can be restored exactly) |
+| `lr_list_presets` / `lr_apply_preset` | Find and apply presets without masks; save the old settings first and optionally return before and after previews |
+| `lr_plan_from_edit` (in development) | Turn a verified single-photo slider edit into a dry-run plan for other photos; use the batch tool to apply after approval |
 | `lr_list_edits` | Lists the changes LrMCP made (id, time, photo, sliders, restored or not) |
 
 Example: select a photo and ask *"Look at the selected photo and tell me what is wrong with the exposure."*
@@ -48,8 +50,8 @@ The assistant gets the picture and numbers such as `mean brightness 77.6`, `warm
   by the plug-in. Delete the file to allow changes again.
 - One photo per call. The plug-in re-checks every rule itself; it does not trust the server.
 - Changes appear in Lightroom's History panel as `LrMCP <id>` steps. **Back up your catalog (`.lrcat`) before using this
-  on real work, and try it on a test catalog first.** If you changed the same slider by hand after an LrMCP change,
-  restoring overwrites your manual value.
+  on real work, and try it on a test catalog first.** The development branch detects later changes before restoring;
+  a conflicting restore requires explicit `force=true` after review.
 
 Files it creates: preview JPEGs (not added to your catalog), a token, a log and the saved change records, all in
 `C:\Users\<you>\LrMcp`.
@@ -111,9 +113,9 @@ compatibility report, feature request) or start a **[discussion](../../discussio
 | Version | Plan |
 |---|---|
 | 0.1 | Read-only: look at photos, develop settings, preview, histogram numbers, self check |
-| **0.2 (now)** | Change one photo's global sliders and HSL with range and step limits, saved old values, restore commands and a read-only switch |
-| next | Preset amount slider, batch presets, installer test on a clean machine (macOS, Photoshop, Premiere paused; masks measured unreliable, not planned) (macOS, Photoshop, Premiere are paused) |
-| later | Teaching mode (plain-language explanations, before/after), learning your taste from rated photos, batch / presets / culling help |
+| 0.2–0.11.1 | Guarded single-photo edits, catalog metadata, batch dry runs, presets, and restoration; see the tools above |
+| current development branch | Restore conflict detection, before/after previews, selected-photo review, and batch plans from verified edits |
+| later | RAW and clean Windows installer acceptance; then consider batch presets and export |
 
 Masks and AI features depend on what Adobe's SDK offers and are not promised.
 

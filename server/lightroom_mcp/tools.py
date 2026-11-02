@@ -28,13 +28,14 @@ INSTRUCTIONS = (
     "(batch only on request), only the photo the user asked for, and only when the user asked for a change. Explain in plain words what "
     "you changed, why and what to expect: the user may be a beginner. Reply in the user's language; the messages returned by the tools "
     "are in Chinese, translate them when needed. If read-only mode is on (~/LrMcp/readonly) every change is refused. "
-    "Masks (local adjustments) cannot be changed.\n\n"
+    "Masks (local adjustments) cannot be changed. Use lr_review_selected to compare selected photos and lr_plan_from_edit "
+    "to rehearse reusing a verified edit on other photos.\n\n"
     "这是 Lightroom Classic 的助手：可以查看用户选中的照片（调整参数、带直方图数字的预览图、目录信息），小步且有保护地修改"
     "（滑块、曲线、裁剪、预设、星级/旗标/关键词、先预演的批量修改），并随时还原每一次修改（lr_restore / lr_restore_original）。"
     "先用 lr_status 确认 Lightroom 已连上。修改前先用 lr_get_preview 看现状；每次只做一小步，改完再看；不满意就还原。"
     "一次只改一张照片（批量只在用户要求时用），只改用户要求的那张，只在用户要求修改时才改。向用户用大白话说明改了什么、为什么、"
     "预期会看到什么变化，用户可能是新手。用用户的语言回复；工具返回的提示是中文。如果开启了只读模式（~/LrMcp/readonly），"
-    "所有修改都会被拒绝。蒙版（局部调整）不能改。"
+    "所有修改都会被拒绝。蒙版（局部调整）不能改。挑片用 lr_review_selected；复用单张修改先用 lr_plan_from_edit 预演。"
 )
 
 SET_DESCRIPTION = (
@@ -45,7 +46,7 @@ SET_DESCRIPTION = (
     "at lr_get_preview after each one). Ranges and limits:\n"
     f"{describe_limits_en()}\n"
     "reason: one sentence saying why (kept in the edit history). photo: \"selected\" (default) or an id from lr_list_selected. "
-    "preview: true also returns a preview image after the change. The old values are saved to disk before anything is written; "
+    "preview: true returns before and after previews plus numeric differences. The old values are saved to disk before anything is written; "
     "the returned edit_id can be given to lr_restore.\n\n"
     "中文：修改**一张**照片的调整参数（滑块、RAW 的白平衡、颜色分级、校准、色调曲线、锐化、降噪、暗角、颗粒、裁剪与拉直）。"
     "做不到：蒙版；预设请用 lr_apply_preset。\n"
@@ -53,7 +54,7 @@ SET_DESCRIPTION = (
     "超出范围、或一次改得比单次限幅还大都会被拒绝，请分几次改，每次改完用 lr_get_preview 看效果。每个参数的范围和单次限幅：\n"
     f"{describe_limits()}\n"
     "reason：一句话说明为什么这样改（会记在修改记录里）。photo：\"selected\"（默认）或 lr_list_selected 返回的 id。"
-    "preview：为 true 时改完顺便返回一张预览图。每次修改前，旧值都已存到磁盘；返回的 edit_id 可交给 lr_restore 还原。"
+    "preview：为 true 时返回修改前后两张预览及统计差异。每次修改前，旧值都已存到磁盘；返回的 edit_id 可交给 lr_restore 还原。"
 )
 
 
@@ -162,17 +163,47 @@ def build_server(bridge: Bridge | None, busy_message: str | None = None, updates
         info, picture = preview_of(photo, long_edge)
         return [_text(info), picture]
 
+    @mcp.tool(annotations=READ_ONLY)
+    @_guard
+    def lr_review_selected(limit: int = 6, long_edge: int = 512) -> list:
+        """Show previews and photo details for up to 10 selected photos in one reply, in Lightroom selection order.
+        This is read-only: suggest picks from the images, then ask before changing ratings or flags.
+
+        一次查看最多 10 张已选照片的预览和参数统计，用于对比挑片；本工具不会改星级或旗标。"""
+        count = max(1, min(int(limit), 10))
+        listing = call("list_selected", {"limit": count}, timeout=30)
+        if not listing.get("photos"):
+            raise ValueError("Lightroom 里没有选中的照片。")
+        rows, images = [], []
+        for photo_info in listing["photos"]:
+            info, picture = preview_of(photo_info["id"], long_edge)
+            rows.append({**photo_info, "preview": info})
+            images.append(picture)
+        return [_text({"selected_count": listing["count"], "shown": len(rows),
+                       "photos": rows, "image_order": [p["id"] for p in rows]}), *images]
+
     edits = EditService(call)
 
     @mcp.tool(annotations=WRITES, description=SET_DESCRIPTION)
     @_guard
     def lr_set_develop(changes: dict[str, float | list], reason: str = "", photo: str = "selected", preview: bool = False) -> list:
-        result = edits.set_develop(changes, reason, _check_photo(photo))
+        photo = _check_photo(photo)
+        if preview:
+            edits.check_writable()
+            if photo == "selected":
+                photo = call("list_selected", {"limit": 1}, timeout=30).get("active_id") or "selected"
+            before_info, before_image = preview_of(photo, config.PREVIEW_DEFAULT_EDGE)
+        result = edits.set_develop(changes, reason, photo)
         out: list = [_text(result)]
         if preview:
-            info, picture = preview_of(result["photo_id"], config.PREVIEW_DEFAULT_EDGE)
-            out[0] = _text({**result, "preview": info})
-            out.append(picture)
+            try:
+                info, picture = preview_of(result["photo_id"], config.PREVIEW_DEFAULT_EDGE)
+            except (OSError, RuntimeError) as e:
+                return [_text({**result, "before_preview": before_info, "preview_error": str(e)}), before_image]
+            out[0] = _text({**result, "before_preview": before_info, "preview": info,
+                            "preview_delta": previews.compare_stats(before_info["stats"], info["stats"]),
+                            "image_order": ["before", "after"]})
+            out.extend([before_image, picture])
         return out
 
     @mcp.tool(annotations=READ_ONLY)
@@ -220,18 +251,29 @@ def build_server(bridge: Bridge | None, busy_message: str | None = None, updates
         """Apply a develop preset to ONE photo (preset_id comes from lr_list_presets). A preset can change a lot at once (curves, colour
         grading, black & white, look ...), so tell the user before applying and check with lr_get_preview afterwards. The whole state of
         the photo is saved first; lr_restore or lr_restore_original brings everything back exactly. Presets with masks / AI, and photos
-        that already have masks, are refused. reason: one sentence why. preview: true also returns a preview image.
+        that already have masks, are refused. reason: one sentence why. preview: true returns before and after previews.
 
         给**一张**照片套用一个开发预设（preset_id 来自 lr_list_presets）。预设可能一次改动很多地方（曲线、颜色分级、黑白、
         镜头外观……），所以套之前要和用户说清楚，套完用 lr_get_preview 看效果。套之前整张照片的设置先存盘；
         用 lr_restore 或 lr_restore_original 可以完全还原。带蒙版/AI 的预设，以及已经有蒙版的照片，会被拒绝。
-        reason：一句话说明为什么套这个预设。preview：为 true 时套完顺便返回一张预览图。"""
-        result = edits.apply_preset(preset_id, reason, _check_photo(photo))
+        reason：一句话说明为什么套这个预设。preview：为 true 时返回套用前后两张预览及统计差异。"""
+        photo = _check_photo(photo)
+        if preview:
+            edits.check_writable()
+            if photo == "selected":
+                photo = call("list_selected", {"limit": 1}, timeout=30).get("active_id") or "selected"
+            before_info, before_image = preview_of(photo, config.PREVIEW_DEFAULT_EDGE)
+        result = edits.apply_preset(preset_id, reason, photo)
         out: list = [_text(result)]
         if preview:
-            info, picture = preview_of(result["photo_id"], config.PREVIEW_DEFAULT_EDGE)
-            out[0] = _text({**result, "preview": info})
-            out.append(picture)
+            try:
+                info, picture = preview_of(result["photo_id"], config.PREVIEW_DEFAULT_EDGE)
+            except (OSError, RuntimeError) as e:
+                return [_text({**result, "before_preview": before_info, "preview_error": str(e)}), before_image]
+            out[0] = _text({**result, "before_preview": before_info, "preview": info,
+                            "preview_delta": previews.compare_stats(before_info["stats"], info["stats"]),
+                            "image_order": ["before", "after"]})
+            out.extend([before_image, picture])
         return out
 
     @mcp.tool(annotations=WRITES)
@@ -261,27 +303,42 @@ def build_server(bridge: Bridge | None, busy_message: str | None = None, updates
             raise ValueError("要真正执行批量修改，需要先用 dry_run=true 预演，并带上返回的 plan_id。")
         return _text(edits.batch_apply(plan_id, reason))
 
+    @mcp.tool(annotations=READ_ONLY)
+    @_guard
+    def lr_plan_from_edit(edit_id: str, photos: str | list[str] = "selected", reason: str = "") -> str:
+        """Plan to reuse a verified single-photo slider edit on other selected photos as relative changes.
+        Does not change photos. The source photo is excluded. Crop and curves are skipped; inspect every planned result
+        and get the user's agreement before calling lr_batch_set_develop(dry_run=false, plan_id=...).
+
+        把一次已验证的单张滑块修改转成其他照片的批量预演，不会立即修改照片；源照片自动排除，裁剪和曲线不复用。
+        向用户说明逐张预演结果并得到同意后，才用返回的 plan_id 调用 lr_batch_set_develop 执行。"""
+        return _text(edits.batch_plan_from_edit(edit_id, photos, reason))
+
     @mcp.tool(annotations=WRITES)
     @_guard
-    def lr_restore(edit_id: str) -> str:
+    def lr_restore(edit_id: str, force: bool = False) -> str:
         """Undo one change: writes back the values from before that change. edit_id comes from the reply of the tool that made the change
         or from lr_list_edits; a batch_id undoes the whole batch. It works for develop changes, presets and catalog information. It only
-        touches what that change touched; if the same setting was changed again later it is set back to the value from before that change.
+        touches what that change touched. If a setting changed later, restore refuses to overwrite it by default;
+        force=true allows overwriting after the user reviews the conflict.
 
         还原一次修改：把那次修改涉及的内容写回修改前的值。edit_id 来自做出修改的工具的返回或 lr_list_edits；批量修改的 batch_id 会一次还原整批。
-        调整参数、预设、目录信息都适用。只还原那次修改碰过的内容；如果之后又改过同一项，会被写回那次修改之前的值。"""
-        return _text(edits.restore(edit_id))
+        调整参数、预设、目录信息都适用。只还原那次修改碰过的内容；如果之后又改过同一项，默认拒绝覆盖。
+        用户明确确认仍要覆盖时才用 force=true。"""
+        return _text(edits.restore(edit_id, bool(force)))
 
     @mcp.tool(annotations=WRITES)
     @_guard
-    def lr_restore_original(photo: str = "selected", dry_run: bool = False) -> str:
+    def lr_restore_original(photo: str = "selected", dry_run: bool = False, force: bool = False) -> str:
         """Put a photo back to how it was before LrMCP first changed it: writes the original values of every develop setting LrMCP
         changed (presets included). Catalog information (rating, flag, keywords ...) is NOT touched, use lr_restore for that.
-        dry_run=true only shows what would be written. Note: a setting the user changed by hand in Lightroom afterwards is overwritten too.
+        dry_run=true shows what would be written and detected conflicts. Later changes are protected by default;
+        force=true overwrites them only after the user explicitly agrees.
 
         让一张照片回到 LrMCP 第一次改它之前的样子：把 LrMCP 改过的所有调整参数（含预设）写回最初的值。目录信息（星级、旗标、关键词等）不受影响，
-        那些请用 lr_restore。dry_run 为 true 时只显示会写回什么，不改任何东西。注意：如果用户在 Lightroom 里手动改过同一项，也会被覆盖。"""
-        return _text(edits.restore_original(_check_photo(photo), bool(dry_run)))
+        那些请用 lr_restore。dry_run 为 true 时显示计划和检测到的冲突，不改任何东西。后续改动默认受保护；
+        用户明确确认仍要覆盖时才用 force=true。"""
+        return _text(edits.restore_original(_check_photo(photo), bool(dry_run), bool(force)))
 
     @mcp.tool(annotations=READ_ONLY)
     @_guard

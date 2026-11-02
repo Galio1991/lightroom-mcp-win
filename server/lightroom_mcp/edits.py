@@ -27,6 +27,8 @@ GLOBAL_KEYS = (
     "Texture", "Clarity2012", "Dehaze", "Vibrance", "Saturation",
 )
 HSL_PREFIXES = ("HueAdjustment", "SaturationAdjustment", "LuminanceAdjustment")
+# Lightroom can rewrite these preset values while rendering a preview, without a user edit.
+VOLATILE_PRESET_KEYS = {"LensBlur"}
 
 # key -> (minimum, maximum, largest change in one call). Keep in sync with plugin/.../Limits.lua (a test compares).
 LIMITS: dict[str, tuple[float, float, float]] = {
@@ -419,6 +421,16 @@ class EditService:
             rows.append({"parameter": key, "before": before.get(key), "requested": want, "after": got, "ok": ok})
         return rows
 
+    @staticmethod
+    def _same(a, b) -> bool:
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool) and not isinstance(b, bool):
+            return abs(a - b) < 1e-3
+        if isinstance(a, list) and isinstance(b, list):
+            return len(a) == len(b) and all(EditService._same(x, y) for x, y in zip(a, b))
+        if isinstance(a, dict) and isinstance(b, dict):
+            return a.keys() == b.keys() and all(EditService._same(a[k], b[k]) for k in a)
+        return a == b
+
     # ---- the four operations ---------------------------------------
     def set_develop(self, changes: dict, reason: str = "", photo: str = "selected") -> dict:
         self.check_writable()
@@ -459,19 +471,27 @@ class EditService:
                     "lr_restore_original 写回 LrMCP 第一次改这张照片之前的值。",
         }
 
-    def restore(self, edit_id: str) -> dict:
+    def restore(self, edit_id: str, force: bool = False) -> dict:
         self.check_writable()
         record = self.store.load(edit_id)
         if record.get("kind") == "meta":
-            return self._restore_meta(record)
+            return self._restore_meta(record, force)
         if record.get("kind") == "batch":
-            return self._restore_batch(record)
+            return self._restore_batch(record, force)
         if record.get("kind") != "set":
             raise EditError("这条记录本身是一次还原，不能再还原。")
         if record.get("restored_by"):
             return {"edit_id": edit_id, "note": f"这次修改已经在 {record['restored_by']} 里还原过了，没有再做任何事。"}
         if record.get("status") == "failed":
             raise EditError("这次修改当时失败了，没有改动照片，不需要还原。")
+        if not force and record.get("after"):
+            current = self.call("snapshot", {"photo": record["photo_id"]}, timeout=60)["settings"]
+            conflicts = [k for k, value in record["after"].items()
+                         if k in record["before"] and k not in VOLATILE_PRESET_KEYS
+                         and not self._same(current.get(k), value)]
+            if conflicts:
+                raise EditError("这些参数在修改后又发生变化，直接还原会覆盖后续调整：" + ", ".join(conflicts)
+                                + "。请先查看当前值；确认仍要覆盖时用 force=true。")
         values = {k: as_number_or_list(v) for k, v in record["before"].items()}
         new_id = self.store.new_id()
         if record.get("generic"):
@@ -501,7 +521,7 @@ class EditService:
             "changes": self._summary(data.get("before", {}), data.get("after", {}), values),
         }
 
-    def restore_original(self, photo: str = "selected", dry_run: bool = False) -> dict:
+    def restore_original(self, photo: str = "selected", dry_run: bool = False, force: bool = False) -> dict:
         if not dry_run:
             self.check_writable()
         if photo == "selected":
@@ -532,10 +552,27 @@ class EditService:
                 earliest_wb = r["before_wb"]
         if not earliest:
             return {"photo_id": photo_id, "note": "没有需要写回的设置。"}
-        plan = {"photo": records[0].get("photo_name"), "edits_undone": [r["edit_id"] for r in records], "will_write": earliest}
+        latest: dict = {}
+        for r in self.store.all():
+            if r.get("photo_id") != photo_id or r.get("status") != "applied" or r.get("kind") not in ("set", "restore"):
+                continue
+            touched = r.get("changed_keys", []) if r.get("generic") else r.get("requested", {})
+            for key in touched:
+                if key in r.get("after", {}):
+                    latest[key] = r["after"][key]
+                else:
+                    latest.pop(key, None)
+        current = self.call("snapshot", {"photo": photo_id}, timeout=60)["settings"]
+        conflicts = [key for key in earliest if key in latest and key not in VOLATILE_PRESET_KEYS
+                     and not self._same(current.get(key), latest[key])]
+        plan = {"photo": records[0].get("photo_name"), "edits_undone": [r["edit_id"] for r in records],
+                "will_write": earliest, "conflicts": conflicts}
         if dry_run:
             return {**plan, "dry_run": True,
-                    "warning": "会把这些滑块写回 LrMCP 第一次改动之前的值；如果你期间手动改过同一个滑块，也会被覆盖。"}
+                    "warning": "会把这些参数写回 LrMCP 第一次改动之前的值；检测到后续修改时默认拒绝，确认覆盖可用 force=true。某些预设参数无法可靠检测冲突，请先检查预演。"}
+        if conflicts and not force:
+            raise EditError("这些参数在 LrMCP 修改后又发生变化：" + ", ".join(conflicts)
+                            + "。请先查看 dry_run 结果；确认仍要覆盖时用 force=true。")
         new_id = self.store.new_id()
         if any(r.get("generic") for r in records):
             payload = dict(earliest)
@@ -656,12 +693,24 @@ class EditService:
             "undo": f"lr_restore(edit_id=\"{record['edit_id']}\") 把这些信息写回修改前的样子（新建过的关键词会留在 Lightroom 的关键词列表里，只是从这张照片上去掉）。",
         }
 
-    def _restore_meta(self, record: dict) -> dict:
+    def _restore_meta(self, record: dict, force: bool = False) -> dict:
         if record.get("restored_by"):
             return {"edit_id": record["edit_id"], "note": f"这次修改已经在 {record['restored_by']} 里还原过了，没有再做任何事。"}
         if record.get("status") == "failed":
             raise EditError("这次修改当时失败了，没有改动照片，不需要还原。")
         before, asked = record["before"], record["requested"]
+        if not force and record.get("after"):
+            current = self.call("get_metadata", {"photo": record["photo_id"]}, timeout=30)["metadata"]
+            after = record["after"]
+            conflicts = [key for key in asked if key not in ("add_keywords", "remove_keywords")
+                         and not self._same(current.get(key), after.get(key))]
+            for keyword in record.get("added_keywords", []) + record.get("removed_keywords", []):
+                if (keyword in current.get("keywords", [])) != (keyword in after.get("keywords", [])):
+                    conflicts.append("keywords")
+                    break
+            if conflicts:
+                raise EditError("这些目录信息在修改后又发生变化：" + ", ".join(conflicts)
+                                + "。请先查看当前值；确认仍要覆盖时用 force=true。")
         wire: dict = {}
         if "rating" in asked:
             wire["rating"] = str(int(before.get("rating", 0)))
@@ -758,6 +807,30 @@ class EditService:
                      f"这个计划 {PLAN_LIFETIME_SECONDS // 60} 分钟内有效，只能用一次。") if items else "没有任何照片可以改，不需要执行。",
         }
 
+    def batch_plan_from_edit(self, edit_id: str, photos="selected", reason: str = "") -> dict:
+        """Reuse a verified single-photo slider change as relative deltas for other photos."""
+        record = self.store.load(edit_id)
+        if record.get("kind") != "set" or record.get("generic") or record.get("status") != "applied" or not record.get("verified"):
+            raise EditError("只能复用已验证的单张滑块修改；预设、失败或未确认的修改不能作为批量模板。")
+        before, after = record.get("before", {}), record.get("after", {})
+        deltas, skipped = {}, []
+        for key in record.get("requested", {}):
+            old, new = before.get(key), after.get(key)
+            if key in BATCH_FORBIDDEN or key in CURVE_KEYS or not isinstance(old, (int, float)) or not isinstance(new, (int, float)):
+                skipped.append(key)
+            elif abs(new - old) > 1e-9:
+                deltas[key] = new - old
+        if not deltas:
+            raise EditError("这次修改没有可用于批量调整的滑块（裁剪和曲线不能批量复用）。")
+        ids = [pid for pid in self._batch_photo_ids(photos) if pid != record["photo_id"]]
+        if not ids:
+            raise EditError("没有其他待处理照片；源照片不会重复套用自己的修改。")
+        plan = self.batch_plan(deltas, ids, reason or f"复用修改 {edit_id}")
+        plan.update(source_edit_id=edit_id, source_photo=record.get("photo_name"),
+                    deltas=deltas, skipped_parameters=skipped,
+                    note="这是相对改动量；请逐张检查预演结果，确认后再用 lr_batch_set_develop 执行。")
+        return plan
+
     def batch_apply(self, plan_id: str, reason: str = "") -> dict:
         self.check_writable()
         plan = self._plans.pop(str(plan_id), None)
@@ -791,13 +864,13 @@ class EditService:
             "undo": f"lr_restore(edit_id=\"{batch_id}\") 一次还原这批里全部照片；也可以用其中某张的 edit_id 单独还原。",
         }
 
-    def _restore_batch(self, record: dict) -> dict:
+    def _restore_batch(self, record: dict, force: bool = False) -> dict:
         if record.get("restored_by"):
             return {"edit_id": record["edit_id"], "note": "这批修改已经还原过了，没有再做任何事。"}
         restored, problems = [], []
         for member in record.get("members", []):
             try:
-                result = self.restore(member)
+                result = self.restore(member, force=force)
                 restored.append({"edit_id": member, "photo": result.get("photo"), "note": result.get("note"), "verified": result.get("verified")})
             except Exception as e:  # noqa: BLE001
                 problems.append({"edit_id": member, "error": str(e)})
@@ -848,8 +921,14 @@ class EditService:
             if key not in before and record["snapshot"].get(key) is not None:
                 before[key] = record["snapshot"][key]
         name = data.get("preset") or preset_id
+        try:
+            after_settings = self.call("snapshot", {"photo": photo_id}, timeout=60)["settings"]
+            after_values = {key: after_settings[key] for key in changed if key in after_settings}
+        except Exception:
+            after_values = {key: row["after"] for key, row in (data.get("changes") or {}).items() if "after" in row}
         record.update(status="applied", before=before, requested={"preset": name}, preset_id=preset_id,
-                      changed_keys=changed, new_keys=list(data.get("new_keys", [])), verified=bool(changed))
+                      changed_keys=changed, new_keys=list(data.get("new_keys", [])), after=after_values,
+                      verified=bool(changed))
         record.pop("snapshot", None)
         self.store.save(record)
         rows = [{"parameter": k, "before": v.get("before"), "after": v.get("after")} for k, v in sorted((data.get("changes") or {}).items())]

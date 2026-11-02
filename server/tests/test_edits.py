@@ -6,6 +6,7 @@ import urllib.parse
 from pathlib import Path
 
 import pytest
+from PIL import Image as PILImage
 
 from lightroom_mcp import edits
 from lightroom_mcp.bridge import BridgeError, BridgeTimeout
@@ -318,9 +319,36 @@ def test_restore_original_uses_first_value_even_after_earlier_edit_was_restored(
     lr, _, service, _ = env
     first = service.set_develop({"Exposure2012": 0.8})
     service.set_develop({"Exposure2012": 1.5})
-    service.restore(first["edit_id"])
+    with pytest.raises(EditError, match="force=true"):
+        service.restore(first["edit_id"])
+    service.restore(first["edit_id"], force=True)
     assert service.restore_original(dry_run=True)["will_write"]["Exposure2012"] == 0.0
     service.restore_original()
+    assert lr.photos[A]["values"]["Exposure2012"] == 0.0
+
+
+def test_restore_refuses_to_overwrite_manual_slider_change_without_force(env):
+    lr, store, service, _ = env
+    first = service.set_develop({"Exposure2012": 0.5})
+    lr.photos[A]["values"]["Exposure2012"] = 0.7
+    with pytest.raises(EditError, match="force=true"):
+        service.restore(first["edit_id"])
+    assert lr.photos[A]["values"]["Exposure2012"] == 0.7
+    assert not store.load(first["edit_id"]).get("restored_by")
+    service.restore(first["edit_id"], force=True)
+    assert lr.photos[A]["values"]["Exposure2012"] == 0.0
+
+
+def test_restore_original_reports_manual_conflicts_before_writing(env):
+    lr, _, service, _ = env
+    service.set_develop({"Exposure2012": 0.5})
+    lr.photos[A]["values"]["Exposure2012"] = 0.7
+    plan = service.restore_original(dry_run=True)
+    assert plan["conflicts"] == ["Exposure2012"]
+    with pytest.raises(EditError, match="force=true"):
+        service.restore_original()
+    assert lr.photos[A]["values"]["Exposure2012"] == 0.7
+    service.restore_original(force=True)
     assert lr.photos[A]["values"]["Exposure2012"] == 0.0
 
 
@@ -402,9 +430,11 @@ def test_tools_are_registered_with_the_right_hints():
     tools = asyncio.run(build_server(None, "x").list_tools())
     hints = {t.name: t.annotations.read_only_hint for t in tools}
     assert hints == {
-        "lr_status": True, "lr_list_selected": True, "lr_get_develop": True, "lr_get_preview": True, "lr_doctor": True,
+        "lr_status": True, "lr_list_selected": True, "lr_get_develop": True, "lr_get_preview": True,
+        "lr_review_selected": True, "lr_doctor": True,
         "lr_set_develop": False, "lr_restore": False, "lr_restore_original": False, "lr_list_edits": True,
-        "lr_list_presets": True, "lr_apply_preset": False, "lr_batch_set_develop": False, "lr_get_metadata": True, "lr_set_metadata": False,
+        "lr_list_presets": True, "lr_apply_preset": False, "lr_batch_set_develop": False,
+        "lr_plan_from_edit": True, "lr_get_metadata": True, "lr_set_metadata": False,
     }
     for tool in tools:   # every description is English first and also has the Chinese text
         text = tool.description or ""
@@ -413,6 +443,33 @@ def test_tools_are_registered_with_the_right_hints():
     set_tool = next(t for t in tools if t.name == "lr_set_develop")
     assert "Exposure2012" in set_tool.description and "单次最多改" in set_tool.description
     assert json.dumps(set_tool.input_schema)  # the schema can be serialised
+
+
+def test_set_develop_preview_returns_before_and_after(env, monkeypatch):
+    from lightroom_mcp import config, previews, tools
+
+    lr, store, _, tmp = env
+    before = tmp / "before.jpg"
+    after = tmp / "after.jpg"
+    PILImage.new("RGB", (64, 48), (70, 70, 70)).save(before)
+    PILImage.new("RGB", (64, 48), (120, 120, 120)).save(after)
+    monkeypatch.setattr(config, "PREVIEW_DIR", tmp)
+    monkeypatch.setattr(previews, "clean_old", lambda: 0)
+    monkeypatch.setattr(tools, "EditService", lambda call: EditService(call, store, readonly_file=tmp / "readonly"))
+
+    class Bridge:
+        def call(self, command, params=None, timeout=30):
+            if command == "get_preview":
+                path = before if lr.photos[A]["values"]["Exposure2012"] == 0 else after
+                return {"path": str(path), "name": "one.ARW"}
+            return lr(command, params, timeout)
+
+    result = asyncio.run(tools.build_server(Bridge()).call_tool(
+        "lr_set_develop", {"changes": {"Exposure2012": 0.3}, "preview": True}))
+    info = json.loads(result.content[0].text)
+    assert info["verified"] and info["image_order"] == ["before", "after"]
+    assert info["preview_delta"]["mean_brightness_0_255"] == 50.0
+    assert [part.type for part in result.content] == ["text", "image", "image"]
 
 
 # ---- white balance (Temperature / Tint) -----------------------------------------------------------------------
@@ -531,6 +588,31 @@ def test_preset_apply_saves_the_whole_state_first_and_restore_brings_everything_
     assert now == start
 
 
+def test_preset_restore_refuses_later_manual_change_without_force(env):
+    lr, _, service, _ = env
+    result = service.apply_preset("PRESET-AAAA-0001")
+    lr.photos[A]["values"]["Look"] = {"Name": "Manual", "Amount": 1.0}
+    with pytest.raises(EditError, match="force=true"):
+        service.restore(result["edit_id"])
+    assert lr.photos[A]["values"]["Look"]["Name"] == "Manual"
+    service.restore(result["edit_id"], force=True)
+    assert lr.photos[A]["values"]["Look"]["Name"] == "Adobe Color"
+
+
+def test_restore_original_allows_lightroom_to_normalize_lens_blur(env):
+    lr, store, service, _ = env
+    result = service.apply_preset("PRESET-AAAA-0001")
+    record = store.load(result["edit_id"])
+    record["before"]["LensBlur"] = {}
+    record["after"]["LensBlur"] = {"FocalRange": "0 0 100 100"}
+    record["changed_keys"].append("LensBlur")
+    store.save(record)
+    lr.photos[A]["values"]["LensBlur"] = {"FocalRange": "-80 0 100 180"}
+    assert service.restore_original(dry_run=True)["conflicts"] == []
+    service.restore_original()
+    assert lr.photos[A]["values"]["LensBlur"] == {}
+
+
 def test_preset_pending_record_holds_a_snapshot_before_anything_is_applied(env):
     lr, store, service, _ = env
     seen = {}
@@ -647,6 +729,30 @@ def test_batch_stops_if_a_photo_changed_after_dry_run(env):
     assert lr.photos[B]["values"]["Exposure2012"] == 0.0
 
 
+def test_batch_plan_from_edit_excludes_source_and_uses_relative_change(env):
+    lr, _, service, _ = env
+    source = service.set_develop({"Exposure2012": 0.3, "Contrast2012": 10})
+    lr.selected = [A, B]
+    plan = service.batch_plan_from_edit(source["edit_id"])
+    assert plan["nothing_was_changed"] and plan["will_change"] == 1
+    assert plan["photos"][0]["photo_id"] == B and plan["deltas"] == {"Exposure2012": 0.3, "Contrast2012": 10.0}
+    assert lr.photos[B]["values"]["Exposure2012"] == 0.0
+    done = service.batch_apply(plan["plan_id"])
+    assert done["changed"] == 1 and lr.photos[B]["values"]["Exposure2012"] == 0.3
+    service.restore(done["batch_id"])
+    assert lr.photos[B]["values"]["Exposure2012"] == 0.0
+
+
+def test_batch_plan_from_edit_refuses_unverified_and_source_only(env):
+    lr, _, service, _ = env
+    source = service.set_develop({"Exposure2012": 0.3})
+    with pytest.raises(EditError, match="没有其他待处理照片"):
+        service.batch_plan_from_edit(source["edit_id"])
+    lr.selected = [A, B]
+    with pytest.raises(EditError, match="只能复用"):
+        service.batch_plan_from_edit(service.apply_preset("PRESET-AAAA-0001")["edit_id"])
+
+
 def test_batch_restore_undoes_every_photo_and_is_idempotent(env):
     lr, store, service, _ = env
     lr.selected = [A, B]
@@ -741,6 +847,17 @@ def test_metadata_restore_only_touches_what_was_changed(env):
     lr.photos[A]["meta"]["title"] = "typed by hand later"
     service.restore(result["edit_id"])
     assert lr.photos[A]["meta"]["rating"] == 0 and lr.photos[A]["meta"]["title"] == "typed by hand later"
+
+
+def test_metadata_restore_refuses_conflicting_rating_without_force(env):
+    lr, _, service, _ = env
+    result = service.set_metadata(rating=4)
+    lr.photos[A]["meta"]["rating"] = 5
+    with pytest.raises(EditError, match="force=true"):
+        service.restore(result["edit_id"])
+    assert lr.photos[A]["meta"]["rating"] == 5
+    service.restore(result["edit_id"], force=True)
+    assert lr.photos[A]["meta"]["rating"] == 0
 
 
 def test_timed_out_metadata_write_keeps_keyword_undo_data(env):

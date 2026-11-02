@@ -14,6 +14,13 @@ BRIGHT_MEAN = 170
 CLIP_HIGHLIGHT_PERCENT = 2.0
 CRUSHED_SHADOW_PERCENT = 5.0
 CAST_PERCENT = 6.0
+COMPARISON_KEYS = ("mean_brightness_0_255", "highlight_clipped_percent",
+                   "shadow_crushed_percent", "warm_cool_index_percent")
+
+
+def compare_stats(before: dict, after: dict) -> dict:
+    """Numeric after-minus-before changes for two rendered previews."""
+    return {key: round(after[key] - before[key], 2) for key in COMPARISON_KEYS}
 
 
 def analyze(path: Path) -> dict:

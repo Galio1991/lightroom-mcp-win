@@ -46,6 +46,10 @@ async def main() -> int:
             print("lr_get_preview content types/sizes:", kinds, "is_error=", preview.is_error)
             info = json.loads(first_text(preview))
             print("   stats notes:", info["stats"]["notes_heuristic"], "| mean", info["stats"]["mean_brightness_0_255"])
+            review = await session.call_tool("lr_review_selected", {"limit": 1, "long_edge": 512})
+            review_info = json.loads(first_text(review))
+            print("lr_review_selected ->", review_info["shown"], "photo(s),",
+                  sum(c.type == "image" for c in review.content), "image(s)")
             doctor = await session.call_tool("lr_doctor", {})
             print("lr_doctor ->")
             out(first_text(doctor))
@@ -71,7 +75,9 @@ async def write_round_trip(session, first_text) -> None:
         res = await session.call_tool("lr_set_develop", {"changes": {"Exposure2012": base + 0.2}, "reason": "mcp smoke test", "preview": True})
         kinds = [c.type for c in res.content]
         info = json.loads(first_text(res))
-        print("lr_set_develop(preview=True) ->", "is_error=", res.is_error, "| content:", kinds, "| verified:", info["verified"], "| has preview stats:", "preview" in info)
+        print("lr_set_develop(preview=True) ->", "is_error=", res.is_error, "| content:", kinds,
+              "| verified:", info["verified"], "| image order:", info.get("image_order"),
+              "| preview delta:", info.get("preview_delta", {}).get("mean_brightness_0_255"))
         bad = await session.call_tool("lr_set_develop", {"changes": {"LensManualDistortionAmount": 5}})
         print("lr_set_develop(LensManualDistortionAmount) is_error=", bad.is_error, "|", " ".join(first_text(bad)[:90].split()))
         jump = await session.call_tool("lr_set_develop", {"changes": {"Exposure2012": base + 3}})
